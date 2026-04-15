@@ -1,177 +1,158 @@
 import cv2
 import numpy as np
 import tritonclient.grpc as grpcclient
-import sys
+from threading import Thread, Lock
+import time
 
-# Lista klas COCO (standard dla YOLOv5, kot jest pod indeksem 15)
-# Możesz to podmienić na swoje klasy jeśli model był customowy.
-COCO_CLASSES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
-    'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
-    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
-    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
-    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
-    'hair drier', 'toothbrush'
-]
+# --- KONFIGURACJA ---
+URL = "10.140.123.226:8001"
+MODEL_NAME = "boundary_detection"
+CONF_THRESH = 0.15
+NMS_THRESH = 0.45
 
 
-def prepare_image(img_path, width=640, height=640):
-    """Przygotowuje obraz i zwraca wersję przygotowaną oraz oryginał z wymiarami."""
-    original_img = cv2.imread(img_path)
-    if original_img is None:
-        print(f"Błąd: Nie znaleziono pliku {img_path}")
-        sys.exit(1)
+# --------------------
 
-    orig_h, orig_w = original_img.shape[:2]
+class TritonStreamer:
+    def __init__(self):
+        print(f"[*] Inicjalizacja połączenia z Tritonem: {URL}...")
+        try:
+            self.client = grpcclient.InferenceServerClient(url=URL)
+            # Sprawdzenie czy serwer i model są gotowe
+            if not self.client.is_server_live():
+                print("[-] BŁĄD: Serwer Triton jest nieosiągalny. Sprawdź VPN/IP.")
+            if not self.client.is_model_ready(MODEL_NAME):
+                print(f"[-] BŁĄD: Model '{MODEL_NAME}' nie jest załadowany na serwerze.")
+            else:
+                print(f"[+] SUKCES: Połączono. Model '{MODEL_NAME}' jest gotowy.")
+        except Exception as e:
+            print(f"[-] BŁĄD krytyczny połączenia: {e}")
 
-    # Preprocessing dla modelu: BGR2RGB -> Resize -> Normalizacja -> NCHW
-    img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (width, height))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, axis=0)
+        self.cap = cv2.VideoCapture(0)
+        self.frame = None
+        self.results = []
+        self.running = True
+        self.lock = Lock()
 
-    return img, original_img, (orig_w, orig_h)
+        # Statystyki
+        self.inference_count = 0
+        self.last_latency = 0
 
+    def camera_thread(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret: break
+            with self.lock:
+                self.frame = frame
+        self.cap.release()
 
-def post_process(raw_predictions, orig_dims, model_dims=(640, 640), conf_threshold=0.20, nms_threshold=0.45):
-    """
-    Wykonuje post-processing na surowym wyjściu YOLOv5.
-    (Kształt: [1, 25200, 85])
-    """
-    detections = raw_predictions[0]  # [25200, 85]
-    orig_w, orig_h = orig_dims
-    model_w, model_h = model_dims
+    def inference_thread(self):
+        print("[*] Wątek inferencji uruchomiony.")
+        while self.running:
+            local_frame = None
+            with self.lock:
+                if self.frame is not None:
+                    local_frame = self.frame.copy()
 
-    # Współczynniki skalowania
-    scale_w = orig_w / model_w
-    scale_h = orig_h / model_h
+            if local_frame is not None:
+                start_time = time.time()
 
-    boxes = []
-    confidences = []
-    class_ids = []
+                # Preprocessing
+                img = cv2.cvtColor(local_frame, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (640, 640))
+                img = img.astype(np.float32) / 255.0
+                img = np.transpose(img, (2, 0, 1))
+                img = np.expand_dims(img, axis=0)
 
-    # 1. Filtrowanie po współczynniku pewności (Confidence Thresholding)
-    for det in detections:
-        # det format: [cx, cy, w, h, objectness, c1, ..., c80]
-        objectness = det[4]
-        if objectness < conf_threshold:
-            continue
+                try:
+                    inputs = [grpcclient.InferInput("images", img.shape, "FP32")]
+                    inputs[0].set_data_from_numpy(img)
+                    outputs = [grpcclient.InferRequestedOutput("output0")]
 
-        # Obliczanie najlepszej klasy i jej wyniku
-        class_scores = det[5:]
-        class_id = np.argmax(class_scores)
-        confidence = objectness * class_scores[class_id]  # Finalny score
+                    response = self.client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+                    raw_preds = response.as_numpy("output0")
 
-        if confidence < conf_threshold:
-            continue
+                    new_results = self.post_process(raw_preds, local_frame.shape[:2])
 
-        # Konwersja współrzędnych modelu (cx, cy, w, h) na absolutne x1, y1
-        # i skalowanie do oryginalnego obrazu.
-        # cv2.dnn.NMSBoxes oczekuje formatu [top_left_x, top_left_y, w, h]
-        cx, cy, w, h = det[:4]
+                    with self.lock:
+                        self.results = new_results
+                        self.inference_count += 1
+                        self.last_latency = (time.time() - start_time) * 1000  # ms
 
-        top_left_x = int((cx - (w / 2)) * scale_w)
-        top_left_y = int((cy - (h / 2)) * scale_h)
-        width = int(w * scale_w)
-        height = int(h * scale_h)
+                    # Feedback co 30 klatek
+                    if self.inference_count % 30 == 0:
+                        det_count = len(new_results)
+                        print(f"[Log] Przetworzono {self.inference_count} klatek. "
+                              f"Latency: {self.last_latency:.0f}ms. Wykryto obiektów: {det_count}")
 
-        boxes.append([top_left_x, top_left_y, width, height])
-        confidences.append(float(confidence))
-        class_ids.append(int(class_id))
+                except Exception as e:
+                    # Wyświetlamy błąd tylko raz na jakiś czas, żeby nie spamować
+                    if self.inference_count % 30 == 0:
+                        print(f"[!] Triton Error: {e}")
 
-    # 2. Non-Maximum Suppression (NMS) - OpenCV ma do tego świetną funkcję
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+            time.sleep(0.01)
 
-    final_detections = []
-    if len(indices) > 0:
-        # NMSBoxes zwraca indeksy w formacie [[idx1], [idx2]...] w starszych wersjach,
-        # lub [idx1, idx2...] w nowszych. Spłaszczamy dla pewności.
-        for i in indices.flatten():
-            final_detections.append({
-                'box': boxes[i],
-                'conf': confidences[i],
-                'class_id': class_ids[i]
-            })
+    def post_process(self, predictions, orig_shape):
+        h_orig, w_orig = orig_shape
+        detections = predictions[0]
+        boxes, confs, class_ids = [], [], []
+        sw, sh = w_orig / 640, h_orig / 640
 
-    return final_detections
+        for det in detections:
+            # YOLOv5: [x, y, w, h, obj, c1, c2...]
+            obj_conf = det[4]
+            if obj_conf > CONF_THRESH:
+                class_scores = det[5:]
+                class_id = np.argmax(class_scores)
+                final_conf = obj_conf * class_scores[class_id]
 
+                if final_conf > CONF_THRESH:
+                    cx, cy, w, h = det[:4]
+                    boxes.append([int((cx - w / 2) * sw), int((cy - h / 2) * sh), int(w * sw), int(h * sh)])
+                    confs.append(float(final_conf))
+                    class_ids.append(int(class_id))
 
-def draw_and_show(image, detections):
-    """Rysuje ramki na obrazie i wyświetla go."""
-    img_copy = image.copy()
+        indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRESH, NMS_THRESH)
+        final = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                final.append({"box": boxes[i], "conf": confs[i], "class": class_ids[i]})
+        return final
 
-    print(f"Liczba wykrytych obiektów po NMS: {len(detections)}")
+    def run(self):
+        t1 = Thread(target=self.camera_thread, daemon=True)
+        t2 = Thread(target=self.inference_thread, daemon=True)
+        t1.start()
+        t2.start()
 
-    for det in detections:
-        x, y, w, h = det['box']
-        conf = det['conf']
-        class_id = det['class_id']
+        print("[*] Interfejs wideo otwarty. Q = Wyjście.")
 
-        # Nazwa klasy i pewność
-        label = f"{COCO_CLASSES[class_id]}: {conf:.2f}"
+        while True:
+            with self.lock:
+                if self.frame is None: continue
+                display_frame = self.frame.copy()
+                current_results = self.results
+                current_latency = self.last_latency
 
-        # Kolor ramki (zielony)
-        color = (0, 255, 0)
+            # Nakładanie ramek
+            for det in current_results:
+                x, y, w, h = det['box']
+                label = f"ID:{det['class']} {det['conf']:.2f}"
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(display_frame, label, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Rysowanie ramki
-        cv2.rectangle(img_copy, (x, y), (x + w, y + h), color, 2)
+            # Informacja o opóźnieniu na ekranie
+            cv2.putText(display_frame, f"Triton Latency: {current_latency:.0f}ms",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # Rysowanie tła pod tekst
-        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.rectangle(img_copy, (x, y - 20), (x + text_size[0], y), color, -1)
-
-        # Rysowanie tekstu
-        cv2.putText(img_copy, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-    # Wyświetlenie obrazu w oknie
-    cv2.imshow("Wynik Boundary Detection", img_copy)
-    print("Obraz wyświetlony. Naciśnij dowolny klawisz w oknie obrazu, aby zamknąć.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-
-def main():
-    # --- KONFIGURACJA ---
-    URL = "10.140.123.226:8001"  # IP Jetsona w sieci VPN
-    MODEL_NAME = "boundary_detection"  # Nazwa Twojego modelu
-    IMAGE_PATH = "test1.jpg"  # Obrazek
-    # --------------------
-
-    try:
-        # 1. Tworzymy klienta
-        client = grpcclient.InferenceServerClient(url=URL)
-
-        # 2. Przygotowanie danych i zapamiętanie oryginału
-        input_data, original_img, original_dims = prepare_image(IMAGE_PATH)
-
-        # 3. Definicja wejścia/wyjścia
-        inputs = [grpcclient.InferInput("images", input_data.shape, "FP32")]
-        inputs[0].set_data_from_numpy(input_data)
-        outputs = [grpcclient.InferRequestedOutput("output0")]
-
-        print(f"Wysyłanie klatki do modelu {MODEL_NAME}...")
-
-        # 4. Inferencja
-        results = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
-
-        # 5. Pobranie surowych wyników
-        raw_predictions = results.as_numpy("output0")
-        print("Udało się otrzymać dane z Tritona.")
-
-        # 6. Post-processing (Kluczowy etap)
-        # Obniżyłem próg pewności do 0.15, bo 0.30 to mało.
-        detections = post_process(raw_predictions, original_dims, conf_threshold=0.15)
-
-        # 7. Wizualizacja
-        draw_and_show(original_img, detections)
-
-    except Exception as e:
-        print(f"Wystąpił błąd: {e}")
+            cv2.imshow("Stream", display_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.running = False
+                break
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    streamer = TritonStreamer()
+    streamer.run()
