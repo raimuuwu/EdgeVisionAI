@@ -1,64 +1,61 @@
-import cv2
 import zmq
+import cv2
 import numpy as np
 import time
 
 # --- KONFIGURACJA ---
-SERVER_IP = "10.8.0.5"  # IP Twojego Jetsona w VPN
-PORT = "5555"
-CONF_THRESH = 0.25
-
+SERVER_IP = "10.141.6.24"  # Zmień jeśli serwer jest na innym kompie
 context = zmq.Context()
-print(f"[*] Łączenie z serwerem AI: {SERVER_IP}:{PORT}...")
-socket = context.socket(zmq.REQ)  # REQ - Request
-socket.connect(f"tcp://{SERVER_IP}:{PORT}")
+socket = context.socket(zmq.REQ)
+socket.connect(f"tcp://{SERVER_IP}:5555")
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(0)  # 0 to domyślna kamerka
 
-
-def preprocess(frame):
-    # Resize do formatu YOLO i konwersja na float32
-    img = cv2.resize(frame, (640, 640))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-    return np.expand_dims(img, axis=0)  # Add batch dim
-
+print("[+] Klient uruchomiony. Naciśnij 'q' aby wyjść.")
 
 while True:
     ret, frame = cap.read()
     if not ret: break
 
-    # 1. Przygotowanie klatki
-    input_tensor = preprocess(frame)
+    h, w, _ = frame.shape
 
-    # 2. Wysyłka do serwera
-    start_t = time.time()
-    socket.send(input_tensor.tobytes())
+    # --- POMIAR CZASU START ---
+    start_time = time.perf_counter()
 
-    # 3. Oczekiwanie na odpowiedź (predykcje)
-    raw_res = socket.recv()
-    predictions = np.frombuffer(raw_res, dtype=np.float32).reshape(1, 25200, 85)
+    # 1. Wysyłka
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    socket.send(buffer)
 
-    latency = (time.time() - start_t) * 1000
+    # 2. Odbiór
+    predictions = socket.recv_json()
 
-    # 4. Prosty Post-processing i Rysowanie
-    # (Dla czytelności kodu uproszczony - bierzemy tylko klatki z wysokim confidence)
-    for det in predictions[0]:
-        if det[4] > CONF_THRESH:
-            # Skalowanie współrzędnych z 640 na rozmiar okna
-            h, w = frame.shape[:2]
-            cx, cy, nw, nh = det[:4]
-            x1 = int((cx - nw / 2) * (w / 640))
-            y1 = int((cy - nh / 2) * (h / 640))
-            cv2.rectangle(frame, (x1, y1), (x1 + int(nw * w / 640), y1 + int(nh * h / 640)), (0, 255, 0), 2)
+    # --- POMIAR CZASU KONIEC ---
+    latency = (time.perf_counter() - start_time) * 1000  # Wynik w milisekundach
 
-    cv2.putText(frame, f"RTT: {latency:.0f}ms", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    # 3. Rysowanie statystyk połączenia
+    stats_text = f"IP: {SERVER_IP} | Latency: {latency:.1f}ms | Objects: {len(predictions)}"
+    # Czarny pasek tła dla czytelności statystyk
+    cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
+    cv2.putText(frame, stats_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    cv2.imshow("Custom AI Cloud", frame)
+    # 4. Rysowanie ramek
+    for pred in predictions:
+        nx, ny, nw, nh = pred['box']
+
+        x1 = int((nx - nw / 2) * w)
+        y1 = int((ny - nh / 2) * h)
+        x2 = int((nx + nw / 2) * w)
+        y2 = int((ny + nh / 2) * h)
+
+        label = f"Obj: {pred['class']} {int(pred['conf'] * 100)}%"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    cv2.imshow("YOLO Engine - NVIDIA GPU", frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+
 
 cap.release()
 cv2.destroyAllWindows()
