@@ -19,7 +19,7 @@ CLASSES = [
 CONF_THRESH = 0.4
 IOU_THRESH = 0.45
 
-session = ort.InferenceSession("yolov5s.onnx")
+session = ort.InferenceSession("best.onnx")
 input_name = session.get_inputs()[0].name
 
 cap = cv2.VideoCapture(0)

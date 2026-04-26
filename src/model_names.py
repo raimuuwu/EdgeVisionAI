@@ -21,3 +21,5 @@ print(models)
 #   version: "1"
 #   state: "READY"
 # }
+# URL = "10.140.123.226:8001"  # IP Jetsona w sieci VPN
+# MODEL_NAME = "boundary_detection"
