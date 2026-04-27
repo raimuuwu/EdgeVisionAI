@@ -4,7 +4,7 @@ import numpy as np
 import time
 
 # --- KONFIGURACJA ---
-SERVER_IP = "10.141.6.24"  # Zmień jeśli serwer jest na innym kompie
+SERVER_IP = "10.141.6.24"
 context = zmq.Context()
 socket = context.socket(zmq.REQ)
 socket.connect(f"tcp://{SERVER_IP}:5555")
