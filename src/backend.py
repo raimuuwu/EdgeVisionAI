@@ -6,11 +6,13 @@ from threading import Thread, Lock
 import time
 import json
 import os
+import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
-ONNX_IP = "10.141.6.24"
+ONNX_IP = "10.141.6.34"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "boundary_detection"
+RASSBERY_IP = "malinkaedgevision"
 
 
 class UnifiedBackend:
@@ -46,14 +48,28 @@ class UnifiedBackend:
         pass
 
     def camera_worker(self):
-        cap = cv2.VideoCapture(0)
+        rpi_ip = RASSBERY_IP
+        port = 5555
+
+        print(f"[*] Łączenie ze strumieniem RPi: tcp://{rpi_ip}:{port}")
+
+        image_hub = imagezmq.ImageHub(open_port=f'tcp://{rpi_ip}:{port}', REQ_REP=False)
+
         while self.running:
-            ret, f = cap.read()
-            if ret:
-                with self.lock:
-                    self.frame = f
-            time.sleep(0.01)
-        cap.release()
+            try:
+                rpi_name, jpg_buffer = image_hub.recv_jpg()
+
+                frame = cv2.imdecode(np.frombuffer(jpg_buffer, dtype='uint8'), cv2.IMREAD_COLOR)
+
+                if frame is not None:
+                    with self.lock:
+                        self.frame = frame
+
+            except Exception as e:
+                print(f"[-] Błąd odbierania klatki z RPi: {e}")
+                time.sleep(1)
+
+        print("[*] Zatrzymano camera_worker.")
 
     def onnx_worker(self):
         while self.running:
