@@ -11,7 +11,7 @@ import imagezmq
 # --- KONFIGURACJA ADRESÓW ---
 ONNX_IP = "10.141.6.34"
 TRITON_URL = "10.140.123.226:8001"
-TRITON_MODEL = "boundary_detection"
+TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
 RASSBERY_IP = "malinkaedgevision"
 
 
@@ -37,39 +37,73 @@ class UnifiedBackend:
         self.onnx_sock.setsockopt(zmq.RCVTIMEO, 2000)  # Timeout 2s
         self.onnx_sock.connect(f"tcp://{ONNX_IP}:5555")
 
+        # Inicjalizacja ZMQ (Frontend - PUB)
+        # Zakładam, że pub_sock był inicjalizowany gdzieś w Twoim kodzie, dodaję bezpieczną definicję:
+        self.pub_sock = self.ctx.socket(zmq.PUB)
+        self.pub_sock.bind("tcp://0.0.0.0:5556")  # Port dla frontendu
+
         # Inicjalizacja Triton
         try:
             self.triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
             self.stats["triton"]["status"] = "Connected" if self.triton_client.is_server_live() else "Error"
-        except:
+        except Exception:
             self.stats["triton"]["status"] = "Offline"
 
-    def _send_to_frontend_placeholder(self, frame, data):
-        pass
 
     def camera_worker(self):
-        rpi_ip = RASSBERY_IP
-        port = 5555
+        # --- WERSJA Z LOKALNĄ KAMERKĄ LAPTOPA (DO TESTÓW) ---
+        print("[*] Inicjalizacja lokalnej kamerki laptopa...")
+        cap = cv2.VideoCapture(0)  # 0 to domyślna wbudowana kamera
 
-        print(f"[*] Łączenie ze strumieniem RPi: tcp://{rpi_ip}:{port}")
-
-        image_hub = imagezmq.ImageHub(open_port=f'tcp://{rpi_ip}:{port}', REQ_REP=False)
+        if not cap.isOpened():
+            print("[-] BŁĄD: Nie można otworzyć lokalnej kamerki.")
+            self.stats["onnx"]["status"] = "Cam Error"
+            self.stats["triton"]["status"] = "Cam Error"
+            return
 
         while self.running:
             try:
-                rpi_name, jpg_buffer = image_hub.recv_jpg()
+                ret, frame = cap.read()
+                if not ret:
+                    print("[-] Błąd odczytu klatki z kamerki laptopa.")
+                    time.sleep(0.1)
+                    continue
 
-                frame = cv2.imdecode(np.frombuffer(jpg_buffer, dtype='uint8'), cv2.IMREAD_COLOR)
+                # Zapisujemy klatkę do współdzielonej zmiennej
+                with self.lock:
+                    self.frame = frame
 
-                if frame is not None:
-                    with self.lock:
-                        self.frame = frame
+                # Mały sleep, żeby nie zajechać procesora (ok. 60 FPS max z kamerki)
+                time.sleep(0.01)
 
             except Exception as e:
-                print(f"[-] Błąd odbierania klatki z RPi: {e}")
+                print(f"[-] Niespodziewany błąd kamerki: {e}")
                 time.sleep(1)
 
-        print("[*] Zatrzymano camera_worker.")
+        cap.release()
+        print("[*] Zatrzymano camera_worker (Lokalna kamerka).")
+        # rpi_ip = RASSBERY_IP
+        # port = 5555
+        #
+        # print(f"[*] Łączenie ze strumieniem RPi: tcp://{rpi_ip}:{port}")
+        #
+        # image_hub = imagezmq.ImageHub(open_port=f'tcp://{rpi_ip}:{port}', REQ_REP=False)
+        #
+        # while self.running:
+        #     try:
+        #         rpi_name, jpg_buffer = image_hub.recv_jpg()
+        #
+        #         frame = cv2.imdecode(np.frombuffer(jpg_buffer, dtype='uint8'), cv2.IMREAD_COLOR)
+        #
+        #         if frame is not None:
+        #             with self.lock:
+        #                 self.frame = frame
+        #
+        #     except Exception as e:
+        #         print(f"[-] Błąd odbierania klatki z RPi: {e}")
+        #         time.sleep(1)
+        #
+        # print("[*] Zatrzymano camera_worker.")
 
     def onnx_worker(self):
         while self.running:
@@ -126,6 +160,8 @@ class UnifiedBackend:
         return final
 
     def triton_worker(self):
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+
         while self.running:
             local_frame = None
             with self.lock:
@@ -135,30 +171,44 @@ class UnifiedBackend:
             if local_frame is not None:
                 start = time.perf_counter()
                 try:
-                    #Preprocessing
-                    img_rgb = cv2.cvtColor(local_frame, cv2.COLOR_BGR2RGB)
-                    img_resized = cv2.resize(img_rgb, (640, 640))
-                    img_input = np.transpose(img_resized.astype(np.float32) / 255.0, (2, 0, 1))[np.newaxis, :]
+                    # 1. Zmiana rozmiaru do 640x640 (tak jak w działającym teście)
+                    if local_frame.shape[:2] != (640, 640):
+                        local_frame = cv2.resize(local_frame, (640, 640))
 
-                    inputs = [grpcclient.InferInput("images", img_input.shape, "FP32")]
-                    inputs[0].set_data_from_numpy(img_input)
-                    outputs = [grpcclient.InferRequestedOutput("output0")]
+                    # 2. Kompresja do JPEG (Triton Ensemble oczekuje surowych bajtów pliku)
+                    ret, buffer = cv2.imencode('.jpg', local_frame, encode_param)
+                    if not ret:
+                        continue
 
-                    res = self.triton_client.infer(model_name=TRITON_MODEL, inputs=inputs, outputs=outputs)
-                    raw_preds = res.as_numpy("output0")
+                    jpeg_bytes = buffer.tobytes()
 
-                    #Postprocessing
-                    processed_results = self.post_process_triton(raw_preds, local_frame.shape[:2])
+                    # 3. Przygotowanie wejścia gRPC zgodnie z konfiguracją modelu ensemble
+                    infer_input = grpcclient.InferInput("input_image", [1], "BYTES")
+                    infer_input.set_data_from_numpy(np.array([jpeg_bytes], dtype=object))
 
+                    # 4. Wywołanie inferencji na serwerze Triton
+                    res = self.triton_client.infer(
+                        model_name=TRITON_MODEL,
+                        inputs=[infer_input],
+                        outputs=[grpcclient.InferRequestedOutput("object_boundaries")]
+                    )
+
+                    # 5. Odbiór i postprocessing danych wyjściowych
+                    raw_preds = res.as_numpy("object_boundaries")
+                    processed_results = self.post_process_triton(raw_preds, (640, 640))
+
+                    # 6. Aktualizacja struktur danych i statystyk
                     self.results_triton = processed_results
                     self.stats["triton"]["latency"] = (time.perf_counter() - start) * 1000
                     self.stats["triton"]["status"] = "Online"
                     self.stats["triton"]["objects"] = len(processed_results)
+
                 except Exception as e:
-                    self.stats["triton"]["status"] = f"Err: {str(e)[:10]}"
+                    self.stats["triton"]["status"] = "Err"
+                    # Opcjonalnie: odkomentuj poniższe, jeśli chcesz debugować konkretny błąd w konsoli:
+                    # print(f"[Triton Worker Error]: {e}")
+
             time.sleep(0.01)
-
-
 
     def stats_printer(self):
         while self.running:
@@ -170,38 +220,40 @@ class UnifiedBackend:
             time.sleep(0.1)
 
     def run(self):
-        # Start wątków
         Thread(target=self.camera_worker, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
 
-        print("[+] Statystyki połączenia:")
+        print("\n[+] Backend uruchomiony w trybie HEADLESS. Czekam na połączenie z frontendu...")
 
-        while True:
-            with self.lock:
-                if self.frame is None: continue
-                display_frame = self.frame.copy()
+        while self.running:
+            try:
+                with self.lock:
+                    if self.frame is None:
+                        time.sleep(0.01)
+                        continue
+                    clean_frame = self.frame.copy()
 
-            #RYSOWANIE ONNX (Zielone)
-            for p in self.results_onnx:
-                h, w = display_frame.shape[:2]
-                nx, ny, nw, nh = p['box']
-                x1, y1 = int((nx - nw / 2) * w), int((ny - nh / 2) * h)
-                x2, y2 = int((nx + nw / 2) * w), int((ny + nh / 2) * h)
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Kompresja klatki do wysyłki na frontend
+                _, buffer = cv2.imencode('.jpg', clean_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
-            #RYSOWANIE TRITON (Niebieskie)
-            for p in self.results_triton:
-                x, y, w_box, h_box = p['box']
-                label = f"Triton: {p['conf']:.2f}"
-                cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (255, 0, 0), 2)
-                cv2.putText(display_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                # Pakiet metadanych
+                metadata = {
+                    "onnx": self.results_onnx,
+                    "triton": self.results_triton,
+                    "stats": self.stats
+                }
 
-            self._send_to_frontend_placeholder(display_frame, {"onnx": self.results_onnx})
+                # Wysyłka streamu przez gniazdo PUB
+                self.pub_sock.send_multipart([
+                    b"ai_stream",
+                    json.dumps(metadata).encode('utf-8'),
+                    buffer.tobytes()
+                ])
 
-            cv2.imshow("Multi-Backend Unified View", display_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+                time.sleep(0.03)  # Limit ok. 30 FPS
+            except KeyboardInterrupt:
                 self.running = False
                 break
 

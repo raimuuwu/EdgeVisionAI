@@ -5,7 +5,7 @@ import onnxruntime as ort
 import json
 
 # --- KONFIGURACJA GPU ---
-MODEL_PATH = "yolov5s.onnx"
+MODEL_PATH = "yolov5s.onnx" #tu trzeba podmienic na nasz
 providers = [('CUDAExecutionProvider', {'device_id': 0}), 'CPUExecutionProvider']
 
 print("[*] Inicjalizacja sesji ONNX...")
