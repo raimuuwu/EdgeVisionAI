@@ -5,14 +5,13 @@ import tritonclient.grpc as grpcclient
 from threading import Thread, Lock
 import time
 import json
-import os
 import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
 ONNX_IP = "10.141.6.34"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
-RASSBERY_IP = "malinkaedgevision"
+RPI_VPN_IP = "10.141.6.25"
 
 
 class UnifiedBackend:
@@ -49,9 +48,8 @@ class UnifiedBackend:
         except Exception:
             self.stats["triton"]["status"] = "Offline"
 
-
-    def camera_worker(self):
-        # --- WERSJA Z LOKALNĄ KAMERKĄ LAPTOPA (DO TESTÓW) ---
+    def camera_worker_local(self):
+        #--- WERSJA Z LOKALNĄ KAMERKĄ LAPTOPA (DO TESTÓW) ---
         print("[*] Inicjalizacja lokalnej kamerki laptopa...")
         cap = cv2.VideoCapture(0)  # 0 to domyślna wbudowana kamera
 
@@ -82,28 +80,36 @@ class UnifiedBackend:
 
         cap.release()
         print("[*] Zatrzymano camera_worker (Lokalna kamerka).")
-        # rpi_ip = RASSBERY_IP
-        # port = 5555
-        #
-        # print(f"[*] Łączenie ze strumieniem RPi: tcp://{rpi_ip}:{port}")
-        #
-        # image_hub = imagezmq.ImageHub(open_port=f'tcp://{rpi_ip}:{port}', REQ_REP=False)
-        #
-        # while self.running:
-        #     try:
-        #         rpi_name, jpg_buffer = image_hub.recv_jpg()
-        #
-        #         frame = cv2.imdecode(np.frombuffer(jpg_buffer, dtype='uint8'), cv2.IMREAD_COLOR)
-        #
-        #         if frame is not None:
-        #             with self.lock:
-        #                 self.frame = frame
-        #
-        #     except Exception as e:
-        #         print(f"[-] Błąd odbierania klatki z RPi: {e}")
-        #         time.sleep(1)
-        #
-        # print("[*] Zatrzymano camera_worker.")
+
+    def camera_worker(self):
+        # !!! WPISZ TUTAJ ADRES IP MALINKI Z OPENVPN (z interfejsu tun0 Malinki) !!!
+        # Na podstawie Twojego zrzutu, jeśli laptop to .45, Malinka pewnie ma coś blisko w klasie 10.141.6.x
+
+        port = 5555
+
+        print(f"[*] [OpenVPN Mode] Łączę się ze strumieniem RPi pod adresem: tcp://{RPI_VPN_IP}:{port}")
+
+        try:
+            # Używamy connect_to i podajemy IP Malinki. Backend wykona operację 'connect' do działającej Malinki.
+            image_hub = imagezmq.ImageHub(open_port=f'tcp://{RPI_VPN_IP}:{port}', REQ_REP=False)
+        except Exception as e:
+            print(f"[-] BŁĄD inicjalizacji ImageHub: {e}")
+            return
+
+        while self.running:
+            try:
+                rpi_name, jpg_buffer = image_hub.recv_jpg()
+                frame = cv2.imdecode(np.frombuffer(jpg_buffer, dtype='uint8'), cv2.IMREAD_COLOR)
+
+                if frame is not None:
+                    with self.lock:
+                        self.frame = frame
+
+            except Exception as e:
+                print(f"[-] Błąd odbierania klatki z RPi: {e}")
+                time.sleep(1)
+
+        print("[*] Zatrzymano camera_worker.")
 
     def onnx_worker(self):
         while self.running:
@@ -257,7 +263,66 @@ class UnifiedBackend:
                 self.running = False
                 break
 
+    def run_local(self):
+        """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
+        Thread(target=self.camera_worker, daemon=True).start()
+        Thread(target=self.onnx_worker, daemon=True).start()
+        Thread(target=self.triton_worker, daemon=True).start()
+        Thread(target=self.stats_printer, daemon=True).start()
+
+        print("\n[+] Backend uruchomiony w trybie LOKALNEGO PODGLĄDU (Debug).")
+        print("[*] Wciśnij 'q' w oknie wideo, aby zamknąć aplikację.")
+
+        while self.running:
+            with self.lock:
+                if self.frame is None:
+                    time.sleep(0.01)
+                    continue
+                display_frame = self.frame.copy()
+
+            h, w = display_frame.shape[:2]
+
+            # 1. RYSOWANIE WYNIKÓW Z ONNX (Zielone ramki)
+            # Pobieramy kopię listy detekcji ONNX
+            current_onnx = list(self.results_onnx)
+            for p in current_onnx:
+                # Jeśli Twój serwer ONNX zwraca strukturę słownikową z kluczem 'box' [x, y, w, h]
+                if isinstance(p, dict) and 'box' in p:
+                    x, y, w_box, h_box = p['box']
+                    cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
+                # Jeśli Twój serwer ONNX zwraca surową listę [x, y, w, h, conf, class] (YOLO format)
+                elif isinstance(p, list) and len(p) >= 4:
+                    cx, cy, nw, nh = p[:4]
+                    x1, y1 = int((cx - nw / 2) * w), int((cy - nh / 2) * h)
+                    x2, y2 = int((cx + nw / 2) * w), int((cy + nh / 2) * h)
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # 2. RYSOWANIE WYNIKÓW Z TRITONA (Niebieskie ramki + tekst)
+            current_triton = list(self.results_triton)
+            for p in current_triton:
+                x, y, w_box, h_box = p['box']
+                label = f"Triton: {p['conf']:.2f}"
+                cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (255, 0, 0), 2)
+                cv2.putText(display_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+            # 3. NAKŁADANIE STATYSTYK NA OBRAZ (Lewy górny róg)
+            o = self.stats["onnx"]
+            t = self.stats["triton"]
+            cv2.putText(display_frame, f"ONNX: {o['status']} ({o['latency']:.0f}ms)", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(display_frame, f"TRITON: {t['status']} ({t['latency']:.0f}ms)", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            # Wyświetlenie okna
+            cv2.imshow("Multi-Backend Debug View", display_frame)
+
+            # Nasłuchiwanie klawisza wyjścia
+            if cv2.waitKey(15) & 0xFF == ord('q'):
+                self.running = False
+                break
+
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     hub = UnifiedBackend()
-    hub.run()
+    hub.run_local()
