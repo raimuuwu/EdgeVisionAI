@@ -5,8 +5,7 @@ import onnxruntime as ort
 import json
 
 # --- KONFIGURACJA ---
-# Wpisz tutaj dokładną nazwę swojego wyeksportowanego pliku .onnx z YOLOv8
-MODEL_PATH = "yolov8_nasz.onnx"
+MODEL_PATH = "best.onnx"
 providers = [('CUDAExecutionProvider', {'device_id': 0}), 'CPUExecutionProvider']
 
 print("[*] Inicjalizacja sesji ONNX (Dla architektury YOLOv8)...")
