@@ -8,7 +8,7 @@ import json
 import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
-ONNX_IP = "10.141.6.34"
+ONNX_IP = "10.141.6.26"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
 RPI_VPN_IP = "10.141.6.25"
@@ -112,6 +112,7 @@ class UnifiedBackend:
         print("[*] Zatrzymano camera_worker.")
 
     def onnx_worker(self):
+        print_tracker = 0
         while self.running:
             local_frame = None
             with self.lock:
@@ -121,15 +122,47 @@ class UnifiedBackend:
             if local_frame is not None:
                 start = time.perf_counter()
                 try:
+                    # Kompresja i konwersja na czysty strumień bajtów (bezpieczniejsze dla serwerów ZMQ)
                     _, buf = cv2.imencode('.jpg', local_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    self.onnx_sock.send(buf)
+                    self.onnx_sock.send(buf.tobytes())
                     res = self.onnx_sock.recv_json()
 
-                    self.results_onnx = res
+                    # --- DEBUG LOG (Wypisze surowy JSON w konsoli raz na 30 klatek, żeby zweryfikować klucze) ---
+                    print_tracker += 1
+                    if print_tracker % 30 == 0:
+                        print(f"\n[DEBUG ONNX RAW JSON]: {res}")
+
+                    # --- INTELIGENTNE ROZPAKOWYWANIE SŁOWNIKA ---
+                    predictions_list = []
+                    if isinstance(res, dict):
+                        # Szukamy klucza, pod którym serwer ukrywa listę detekcji
+                        for key in ["predictions", "boxes", "results", "detections", "output"]:
+                            if key in res and isinstance(res[key], list):
+                                predictions_list = res[key]
+                                break
+                        else:
+                            # Awaryjnie: bierzemy pierwszą napotkaną listę, pomijając listę nazw klas 'names'
+                            for k, val in res.items():
+                                if k != "names" and isinstance(val, list):
+                                    predictions_list = val
+                                    break
+                    elif isinstance(res, list):
+                        predictions_list = res
+
+                    # Odsiewamy opisy tekstowe klas, zostawiamy wyłącznie czyste dane obiektów
+                    clean_predictions = []
+                    for item in predictions_list:
+                        if isinstance(item, str) and ("names" in item or "classes" in item):
+                            continue
+                        clean_predictions.append(item)
+
+                    # Zapisujemy wyczyszczoną listę do rysowania i aktualizujemy HUD
+                    self.results_onnx = clean_predictions
                     self.stats["onnx"]["latency"] = (time.perf_counter() - start) * 1000
                     self.stats["onnx"]["status"] = "Online"
-                    self.stats["onnx"]["objects"] = len(res)
-                except Exception:
+                    self.stats["onnx"]["objects"] = len(clean_predictions)  # Teraz to prawdziwa liczba obiektów!
+
+                except Exception as e:
                     self.stats["onnx"]["status"] = "Timeout/Err"
             time.sleep(0.01)
 
@@ -265,7 +298,7 @@ class UnifiedBackend:
 
     def run_local(self):
         """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
-        Thread(target=self.camera_worker, daemon=True).start()
+        Thread(target=self.camera_worker_local, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
@@ -283,29 +316,79 @@ class UnifiedBackend:
             h, w = display_frame.shape[:2]
 
             # 1. RYSOWANIE WYNIKÓW Z ONNX (Zielone ramki)
-            # Pobieramy kopię listy detekcji ONNX
             current_onnx = list(self.results_onnx)
             for p in current_onnx:
-                # Jeśli Twój serwer ONNX zwraca strukturę słownikową z kluczem 'box' [x, y, w, h]
-                if isinstance(p, dict) and 'box' in p:
-                    x, y, w_box, h_box = p['box']
-                    cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
-                # Jeśli Twój serwer ONNX zwraca surową listę [x, y, w, h, conf, class] (YOLO format)
-                elif isinstance(p, list) and len(p) >= 4:
-                    cx, cy, nw, nh = p[:4]
-                    x1, y1 = int((cx - nw / 2) * w), int((cy - nh / 2) * h)
-                    x2, y2 = int((cx + nw / 2) * w), int((cy + nh / 2) * h)
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                try:
+                    # OBSŁUGA FORMATU: Słownik {'box': [x1,y1,x2,y2], 'conf':..., 'class':...}
+                    if isinstance(p, dict) and 'box' in p:
+                        box = p['box']
+                        class_id = p.get('class', 0)
+                        conf = p.get('conf', 0.0)
 
-            # 2. RYSOWANIE WYNIKÓW Z TRITONA (Niebieskie ramki + tekst)
+                        # Sprawdzamy czy dane to ułamki 0.0 - 1.0 (znormalizowane)
+                        is_normalized = all(float(x) <= 1.05 for x in box)
+
+                        # Sprawdzamy czy to format narożników [x1, y1, x2, y2] czy środka [cx, cy, nw, nh]
+                        if box[2] >= box[0] and box[3] >= box[1]:
+                            x1 = int(box[0] * w if is_normalized else box[0])
+                            y1 = int(box[1] * h if is_normalized else box[1])
+                            x2 = int(box[2] * w if is_normalized else box[2])
+                            y2 = int(box[3] * h if is_normalized else box[3])
+                        else:
+                            # Format YOLO: [cx, cy, nw, nh]
+                            cx, cy, nw, nh = box
+                            if is_normalized:
+                                x1 = int((cx - nw / 2) * w)
+                                y1 = int((cy - nh / 2) * h)
+                                x2 = int((cx + nw / 2) * w)
+                                y2 = int((cy + nh / 2) * h)
+                            else:
+                                x1 = int(cx - nw / 2)
+                                y1 = int(cy - nh / 2)
+                                x2 = int(cx + nw / 2)
+                                y2 = int(cy + nh / 2)
+
+                        # Rysowanie na ekranie
+                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(display_frame, f"ONNX ID {class_id} ({conf:.2f})", (x1, y1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        continue
+
+                    # Alternatywny fallback dla czystych list/stringów (na wszelki wypadek)
+                    if isinstance(p, str):
+                        parts = [float(x) for x in p.strip().split()]
+                    elif isinstance(p, (list, tuple)):
+                        parts = [float(x) for x in p]
+                    else:
+                        continue
+
+                    if len(parts) >= 5:
+                        class_id = int(parts[0])
+                        cx, cy, nw, nh = parts[1:5]
+                        x1 = int((cx - nw / 2) * w) if cx <= 1.05 else int(cx - nw / 2)
+                        y1 = int((cy - nh / 2) * h) if cy <= 1.05 else int(cy - nh / 2)
+                        x2 = int((cx + nw / 2) * w) if nw <= 1.05 else int(cx + nw / 2)
+                        y2 = int((cy + nh / 2) * h) if nh <= 1.05 else int(cy + nh / 2)
+
+                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(display_frame, f"ONNX ID: {class_id}", (x1, y1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                except Exception as e:
+                    print(f"\n[-] Błąd rysowania ONNX: {e} | Dane: {p}")
+
+            # 2. RYSOWANIE WYNIKÓW Z TRITONA (Niebieskie ramki)
             current_triton = list(self.results_triton)
             for p in current_triton:
-                x, y, w_box, h_box = p['box']
-                label = f"Triton: {p['conf']:.2f}"
-                cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (255, 0, 0), 2)
-                cv2.putText(display_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                try:
+                    x, y, w_box, h_box = map(int, p['box'][:4])
+                    label = f"Triton: {p['conf']:.2f}"
+                    cv2.rectangle(display_frame, (x, y), (x + w_box, y + h_box), (255, 0, 0), 2)
+                    cv2.putText(display_frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                except Exception:
+                    pass
 
-            # 3. NAKŁADANIE STATYSTYK NA OBRAZ (Lewy górny róg)
+            # 3. NAKŁADANIE STATYSTYK (HUD)
             o = self.stats["onnx"]
             t = self.stats["triton"]
             cv2.putText(display_frame, f"ONNX: {o['status']} ({o['latency']:.0f}ms)", (10, 20),
@@ -313,10 +396,8 @@ class UnifiedBackend:
             cv2.putText(display_frame, f"TRITON: {t['status']} ({t['latency']:.0f}ms)", (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-            # Wyświetlenie okna
             cv2.imshow("Multi-Backend Debug View", display_frame)
 
-            # Nasłuchiwanie klawisza wyjścia
             if cv2.waitKey(15) & 0xFF == ord('q'):
                 self.running = False
                 break
