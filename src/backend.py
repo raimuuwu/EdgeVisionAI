@@ -11,7 +11,7 @@ import imagezmq
 ONNX_IP = "10.141.6.26"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
-RPI_VPN_IP = "10.141.6.25"
+RPI_VPN_IP = "malinkaedgevision"
 
 
 class UnifiedBackend:
@@ -298,7 +298,7 @@ class UnifiedBackend:
 
     def run_local(self):
         """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
-        Thread(target=self.camera_worker_local, daemon=True).start()
+        Thread(target=self.camera_worker, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
