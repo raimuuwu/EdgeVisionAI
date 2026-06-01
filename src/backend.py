@@ -30,6 +30,9 @@ class UnifiedBackend:
         self.results_onnx = []
         self.results_triton = []
 
+        # Śledzenie połączenia z frontendem
+        self.last_frontend_ping = 0
+
         # Inicjalizacja ZMQ (ONNX)
         self.ctx = zmq.Context()
         self.onnx_sock = self.ctx.socket(zmq.REQ)
@@ -37,9 +40,13 @@ class UnifiedBackend:
         self.onnx_sock.connect(f"tcp://{ONNX_IP}:5555")
 
         # Inicjalizacja ZMQ (Frontend - PUB)
-        # Zakładam, że pub_sock był inicjalizowany gdzieś w Twoim kodzie, dodaję bezpieczną definicję:
         self.pub_sock = self.ctx.socket(zmq.PUB)
         self.pub_sock.bind("tcp://0.0.0.0:5556")  # Port dla frontendu
+
+        # Inicjalizacja ZMQ (Frontend - REP dla systemu Ping-Pong)
+        self.ping_sock = self.ctx.socket(zmq.REP)
+        self.ping_sock.setsockopt(zmq.RCVTIMEO, 1000)  # Nieblokujący timeout 1s
+        self.ping_sock.bind("tcp://0.0.0.0:5557")
 
         # Inicjalizacja Triton
         try:
@@ -112,7 +119,6 @@ class UnifiedBackend:
         print("[*] Zatrzymano camera_worker.")
 
     def onnx_worker(self):
-        print_tracker = 0
         while self.running:
             local_frame = None
             with self.lock:
@@ -122,26 +128,17 @@ class UnifiedBackend:
             if local_frame is not None:
                 start = time.perf_counter()
                 try:
-                    # Kompresja i konwersja na czysty strumień bajtów (bezpieczniejsze dla serwerów ZMQ)
                     _, buf = cv2.imencode('.jpg', local_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     self.onnx_sock.send(buf.tobytes())
                     res = self.onnx_sock.recv_json()
 
-                    # --- DEBUG LOG (Wypisze surowy JSON w konsoli raz na 30 klatek, żeby zweryfikować klucze) ---
-                    print_tracker += 1
-                    if print_tracker % 30 == 0:
-                        print(f"\n[DEBUG ONNX RAW JSON]: {res}")
-
-                    # --- INTELIGENTNE ROZPAKOWYWANIE SŁOWNIKA ---
                     predictions_list = []
                     if isinstance(res, dict):
-                        # Szukamy klucza, pod którym serwer ukrywa listę detekcji
                         for key in ["predictions", "boxes", "results", "detections", "output"]:
                             if key in res and isinstance(res[key], list):
                                 predictions_list = res[key]
                                 break
                         else:
-                            # Awaryjnie: bierzemy pierwszą napotkaną listę, pomijając listę nazw klas 'names'
                             for k, val in res.items():
                                 if k != "names" and isinstance(val, list):
                                     predictions_list = val
@@ -149,22 +146,20 @@ class UnifiedBackend:
                     elif isinstance(res, list):
                         predictions_list = res
 
-                    # Odsiewamy opisy tekstowe klas, zostawiamy wyłącznie czyste dane obiektów
                     clean_predictions = []
                     for item in predictions_list:
                         if isinstance(item, str) and ("names" in item or "classes" in item):
                             continue
                         clean_predictions.append(item)
 
-                    # Zapisujemy wyczyszczoną listę do rysowania i aktualizujemy HUD
                     self.results_onnx = clean_predictions
                     self.stats["onnx"]["latency"] = (time.perf_counter() - start) * 1000
                     self.stats["onnx"]["status"] = "Online"
-                    self.stats["onnx"]["objects"] = len(clean_predictions)  # Teraz to prawdziwa liczba obiektów!
+                    self.stats["onnx"]["objects"] = len(clean_predictions)
 
-                except Exception as e:
+                except Exception:
                     self.stats["onnx"]["status"] = "Timeout/Err"
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     def post_process_triton(self, predictions, orig_shape):
         h_orig, w_orig = orig_shape
@@ -249,12 +244,33 @@ class UnifiedBackend:
 
             time.sleep(0.01)
 
+    def ping_worker(self):
+        while self.running:
+            try:
+                # Oczekiwanie na sygnał od frontendu
+                _ = self.ping_sock.recv_string()
+                self.last_frontend_ping = time.time()
+                self.ping_sock.send_string("PONG - Backend słyszy frontend!")
+            except zmq.error.Again:
+                # Brak pingu w danej sekundzie - pętla kręci się dalej
+                pass
+            except Exception:
+                time.sleep(0.5)
+
     def stats_printer(self):
         while self.running:
             o = self.stats["onnx"]
             t = self.stats["triton"]
-            line = (f"\rONNX: [{o['status']}] {o['latency']:4.0f}ms, Obj: {o['objects']} | "
-                    f"TRITON: [{t['status']}] {t['latency']:4.0f}ms, Obj: {t['objects']}   ")
+
+            # Weryfikacja aktywności połączenia z frontendem
+            if self.last_frontend_ping > 0 and (time.time() - self.last_frontend_ping < 15.0):
+                fe_status = "Connected"
+            else:
+                fe_status = "Disconnected"
+
+            line = (f"\r[SERWERY] ONNX: [{o['status']}] {o['latency']:4.0f}ms (Widzi: {o['objects']}) | "
+                    f"TRITON: [{t['status']}] {t['latency']:4.0f}ms (Widzi: {t['objects']}) | "
+                    f"[FRONTEND]: [{fe_status}]   ")
             print(line, end="", flush=True)
             time.sleep(0.1)
 
@@ -329,7 +345,7 @@ class UnifiedBackend:
 
     def run_local(self):
         """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
-        Thread(target=self.camera_worker_local, daemon=True).start()
+        Thread(target=self.camera_worker, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
