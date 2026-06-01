@@ -5,11 +5,11 @@ import urllib.request
 from threading import Thread, Lock
 import time
 
-#  KONFIGURACJA
+# --- KONFIGURACJA ---
 URL          = "10.140.123.226:8001"
 METRICS_URL  = "http://10.140.123.226:8002/metrics"
 MODEL_NAME   = "ensemble_model"
-CONF_THRESH  = 0.15
+CONF_THRESH  = 0.25  # Dla YOLOv8 warto zacząć od 0.25
 NMS_THRESH   = 0.45
 
 # Docelowa liczba klatek wysyłanych do Tritona na sekundę.
@@ -190,7 +190,7 @@ class TritonStreamer:
 
             start = time.time()
             try:
-                # Resize po stronie klienta — mniejszy payload przez sieć
+                # Resize po stronie klienta
                 if local_frame.shape[:2] != (SEND_HEIGHT, SEND_WIDTH):
                     local_frame = cv2.resize(local_frame, (SEND_WIDTH, SEND_HEIGHT))
 
@@ -198,15 +198,18 @@ class TritonStreamer:
                 if not ret:
                     continue
 
-                jpeg_bytes  = buffer.tobytes()
+                # KRYTYCZNE: Używamy stabilnego typu UINT8, aby ominąć błąd 1.7 GB w Tritonie
+                img_encoded = np.array(buffer, dtype=np.uint8).flatten()
+                
                 infer_input = grpcclient.InferInput("input_image", [1], "BYTES")
-                infer_input.set_data_from_numpy(np.array([jpeg_bytes], dtype=object))
+                infer_input.set_data_from_numpy(np.array([img_encoded.tobytes()], dtype=object))
 
                 response  = self.client.infer(
                     model_name=MODEL_NAME,
                     inputs=[infer_input],
                     outputs=[grpcclient.InferRequestedOutput("object_boundaries")]
                 )
+                
                 raw_preds  = response.as_numpy("object_boundaries")
                 new_results = self.post_process(raw_preds, (SEND_HEIGHT, SEND_WIDTH))
 
@@ -220,7 +223,7 @@ class TritonStreamer:
                     print(f"[Log] Klatek: {self.inference_count} | "
                           f"Pominieto: {self.skipped_count} | "
                           f"Latency E2E: {latency:.0f}ms | "
-                          f"Payload: {len(jpeg_bytes)/1024:.1f} KB")
+                          f"Payload: {len(img_encoded)/1024:.1f} KB")
 
             except Exception as e:
                 print(f"[!] Triton Error: {e}")
@@ -230,27 +233,39 @@ class TritonStreamer:
 
     def post_process(self, predictions, orig_shape):
         h_orig, w_orig = orig_shape
-        detections     = predictions[0]
+        
+        # ---------------------------------------------------------
+        # NOWY POST-PROCESSING DLA YOLOv8
+        # ---------------------------------------------------------
+        # Kształt wejściowy z YOLOv8 to [1, 4+klasy, 8400]. 
+        # Bierzemy pierwszy element i obracamy (transponujemy) macierz na [8400, 4+klasy]
+        detections = np.transpose(predictions[0])
+        
         boxes, confs, class_ids = [], [], []
         sw, sh = w_orig / 640, h_orig / 640
 
         for det in detections:
-            obj_conf = det[4]
-            if obj_conf > CONF_THRESH:
-                class_scores = det[5:]
-                class_id     = np.argmax(class_scores)
-                final_conf   = obj_conf * class_scores[class_id]
-                if final_conf > CONF_THRESH:
-                    cx, cy, w, h = det[:4]
-                    boxes.append([
-                        int((cx - w / 2) * sw), int((cy - h / 2) * sh),
-                        int(w * sw),             int(h * sh)
-                    ])
-                    confs.append(float(final_conf))
-                    class_ids.append(int(class_id))
+            # W YOLOv8 pierwsze 4 wartości to [cx, cy, w, h]
+            # Wszystkie kolejne wartości to prawdopodobieństwa dla poszczególnych klas
+            scores = det[4:]
+            class_id = np.argmax(scores)
+            max_score = scores[class_id]
 
+            if max_score > CONF_THRESH:
+                cx, cy, w, h = det[:4]
+                # Konwersja ze środka (cx, cy) na lewy górny róg (x, y) i przeskalowanie
+                boxes.append([
+                    int((cx - w / 2) * sw), 
+                    int((cy - h / 2) * sh),
+                    int(w * sw),             
+                    int(h * sh)
+                ])
+                confs.append(float(max_score))
+                class_ids.append(int(class_id))
+
+        # Filtrowanie nakładających się na siebie ramek
         indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRESH, NMS_THRESH)
-        final   = []
+        final = []
         if len(indices) > 0:
             for i in indices.flatten():
                 final.append({"box": boxes[i], "conf": confs[i], "class": class_ids[i]})
