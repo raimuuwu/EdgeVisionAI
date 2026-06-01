@@ -8,7 +8,7 @@ import json
 import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
-ONNX_IP = "10.141.6.26"
+ONNX_IP = "10.141.6.4"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
 RPI_VPN_IP = "malinkaedgevision"
@@ -258,47 +258,78 @@ class UnifiedBackend:
             print(line, end="", flush=True)
             time.sleep(0.1)
 
-    def run(self):
-        Thread(target=self.camera_worker, daemon=True).start()
+    def run(self, use_rpi=True):
+        """
+        Główna pętla uruchamiająca backend systemu.
+        :param use_rpi: True - pobiera obraz z Raspberry Pi przez OpenVPN.
+                        False - pobiera obraz z lokalnej kamerki internetowej (do testów).
+        """
+        # 1. Dynamiczne uruchamianie właściwego wątku kamery
+        if use_rpi:
+            print("[*] Uruchamianie kamery: Oczekiwanie na strumień z Raspberry Pi (Malinka)...")
+            Thread(target=self.camera_worker, daemon=True).start()
+        else:
+            print("[*] Uruchamianie kamery: Inicjalizacja lokalnej kamerki internetowej...")
+            Thread(target=self.camera_worker_local, daemon=True).start()
+
+        # 2. Uruchomienie wątków detekcji AI oraz statystyk
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
 
-        print("\n[+] Backend uruchomiony w trybie HEADLESS. Czekam na połączenie z frontendu...")
+        # Inteligentne wsparcie dla wątku testowego (ping_worker), jeśli istnieje w tej wersji klasy
+        if hasattr(self, 'ping_worker'):
+            Thread(target=self.ping_worker, daemon=True).start()
+
+        print(f"\n[+] Centralny Backend AI działa w trybie strumieniowania (PUB) na porcie 5556.")
+        print("[*] Czekam na klatki wideo i podłączenie zewnętrznego frontendu...\n")
+
+        last_warning_time = time.time()
 
         while self.running:
             try:
                 with self.lock:
                     if self.frame is None:
-                        time.sleep(0.01)
+                        # System ostrzegawczy w konsoli: informuje, że pętla żyje, ale nie ma obrazu
+                        if time.time() - last_warning_time > 5.0:
+                            print(" [!] OSTRZEŻENIE: Brak obrazu w pamięci (self.frame jest None). "
+                                  "Główna pętla czeka na uruchomienie kamery i nie wysyła nic na frontend!")
+                            last_warning_time = time.time()
+                        time.sleep(0.02)
                         continue
                     clean_frame = self.frame.copy()
 
-                # Kompresja klatki do wysyłki na frontend
+                # Kompresja klatki do formatu JPEG przed wysyłką sieciową
                 _, buffer = cv2.imencode('.jpg', clean_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
 
-                # Pakiet metadanych
+                # Przygotowanie pełnego pakietu metadanych AI
                 metadata = {
                     "onnx": self.results_onnx,
                     "triton": self.results_triton,
                     "stats": self.stats
                 }
 
-                # Wysyłka streamu przez gniazdo PUB
+                # Wieloczęściowa wysyłka ZMQ (Topic + JSON metadanych + Bajty obrazu)
                 self.pub_sock.send_multipart([
                     b"ai_stream",
                     json.dumps(metadata).encode('utf-8'),
                     buffer.tobytes()
                 ])
 
-                time.sleep(0.03)  # Limit ok. 30 FPS
+                # Kontrola płynności (ok. 30 klatek na sekundę)
+                time.sleep(0.03)
+
             except KeyboardInterrupt:
+                print("\n[-] Wykryto zamknięcie aplikacji (Ctrl+C). Kończenie pracy backendu...")
                 self.running = False
                 break
+            except Exception as e:
+                print(f"\n[-] Krytyczny błąd w pętli głównej wysyłania: {e}")
+                time.sleep(0.1)
 
     def run_local(self):
         """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
-        Thread(target=self.camera_worker, daemon=True).start()
+        Thread(target=self.camera_worker_local, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
@@ -406,4 +437,4 @@ class UnifiedBackend:
 
 if __name__ == "__main__":
     hub = UnifiedBackend()
-    hub.run_local()
+    hub.run(False)
