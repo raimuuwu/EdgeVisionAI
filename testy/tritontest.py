@@ -7,7 +7,7 @@ import time
 # --- KONFIGURACJA ---
 URL          = "10.140.123.226:8001"
 MODEL_NAME   = "ensemble_model"
-CONF_THRESH  = 0.25  # Podniosłem z 0.05 na 0.25 (optymalne dla YOLOv8)
+CONF_THRESH  = 0.25
 NMS_THRESH   = 0.45
 
 TARGET_INFERENCE_FPS = 30
@@ -38,9 +38,16 @@ class TritonStreamer:
 
         self.inference_busy   = False
         self.last_latency     = 0
+        self.inference_count  = 0
+        self.skipped_count    = 0
 
         self._min_interval = 1.0 / TARGET_INFERENCE_FPS
         self._last_sent    = 0.0
+
+        # Zmienne do statystyk Tritona
+        self.prev_server_count = 0
+        self.prev_compute_ns = 0
+        self.prev_queue_ns = 0
 
     def camera_thread(self):
         while self.running:
@@ -61,7 +68,8 @@ class TritonStreamer:
             with self.lock:
                 too_soon = (now - self._last_sent) < self._min_interval
                 if self.inference_busy or too_soon:
-                    pass
+                    if self.inference_busy:
+                        self.skipped_count += 1
                 elif self.frame is not None:
                     local_frame        = self.frame.copy()
                     self.frame         = None
@@ -99,14 +107,53 @@ class TritonStreamer:
 
                 latency = (time.time() - start) * 1000
                 with self.lock:
-                    self.results      = new_results
-                    self.last_latency = latency
+                    self.results         = new_results
+                    self.last_latency    = latency
+                    self.inference_count += 1
 
             except Exception as e:
                 print(f"[!] Triton Error: {e}")
             finally:
                 with self.lock:
                     self.inference_busy = False
+
+    def stats_thread(self):
+        """Lekki wątek drukujący raport w konsoli co 10 sekund."""
+        while self.running:
+            time.sleep(10)
+            if not self.running:
+                break
+            
+            with self.lock:
+                frames = self.inference_count
+                skipped = self.skipped_count
+                e2e = self.last_latency
+
+            print("\n" + "-" * 50)
+            print(f"--- STATYSTYKI [{time.strftime('%H:%M:%S')}] ---")
+            print(f"Klient: Przetworzono: {frames} | Pominięto: {skipped} | E2E Latency: {e2e:.0f} ms")
+
+            # Pobieranie statystyk serwera gRPC
+            try:
+                stats = self.client.get_inference_statistics(model_name=MODEL_NAME, as_json=False)
+                if len(stats.model_stats) > 0:
+                    inf = stats.model_stats[0].inference_stats
+                    count = inf.success.count
+                    compute_ns = inf.compute_infer.ns
+                    queue_ns = inf.queue.ns
+
+                    delta_count = count - self.prev_server_count
+                    if delta_count > 0:
+                        avg_compute = (compute_ns - self.prev_compute_ns) / delta_count / 1e6
+                        avg_queue = (queue_ns - self.prev_queue_ns) / delta_count / 1e6
+                        print(f"Serwer: Ostatnie {delta_count} klatek -> Inferencja GPU: {avg_compute:.1f} ms | Kolejka: {avg_queue:.1f} ms")
+                    
+                    self.prev_server_count = count
+                    self.prev_compute_ns = compute_ns
+                    self.prev_queue_ns = queue_ns
+            except:
+                pass
+            print("-" * 50)
 
     def post_process(self, predictions, orig_shape):
         h_orig, w_orig = orig_shape
@@ -137,10 +184,11 @@ class TritonStreamer:
         return final
 
     def run(self):
-        Thread(target=self.camera_thread,   daemon=True).start()
+        Thread(target=self.camera_thread, daemon=True).start()
         Thread(target=self.inference_thread, daemon=True).start()
+        Thread(target=self.stats_thread, daemon=True).start() # Uruchomienie lekkiego wątku statystyk
 
-        print("[*] Interfejs wideo otwarty. Q = Wyjscie.")
+        print("[*] Strumieniowanie wideo aktywne. Wcisnij 'Q' w oknie zeby wyjsc.")
 
         while True:
             with self.lock:
