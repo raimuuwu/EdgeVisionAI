@@ -8,11 +8,14 @@ import json
 import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
-ONNX_IP = "10.141.6.4"
+ONNX_IP = "127.0.0.1"
 TRITON_URL = "10.140.123.226:8001"
 TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
 RPI_VPN_IP = "malinkaedgevision"
 
+# --- PROGI DETEKCJI ZGODNE Z DZIAŁAJĄCYM SKRYPTEM ---
+CONF_THRESH = 0.25
+NMS_THRESH = 0.45
 
 class UnifiedBackend:
     def __init__(self):
@@ -163,30 +166,30 @@ class UnifiedBackend:
 
     def post_process_triton(self, predictions, orig_shape):
         h_orig, w_orig = orig_shape
-        detections = predictions[0]
-        boxes, confs, class_ids = [], [], []
+        # YOLOv8 zwraca kształt [1, 84, 8400], transponujemy do [8400, 84]
+        detections = np.transpose(predictions[0])
 
+        boxes, confs, class_ids = [], [], []
         sw, sh = w_orig / 640, h_orig / 640
 
         for det in detections:
-            obj_conf = det[4]
-            if obj_conf > 0.15:  # Threshold detekcji
-                class_scores = det[5:]
-                class_id = np.argmax(class_scores)
-                final_conf = obj_conf * class_scores[class_id]
+            scores = det[4:]  # W YOLOv8 od indeksu 4 zaczynają się pewności klas
+            class_id = np.argmax(scores)
+            max_score = scores[class_id]
 
-                if final_conf > 0.15:
-                    cx, cy, w, h = det[:4]
-                    boxes.append([
-                        int((cx - w / 2) * sw),
-                        int((cy - h / 2) * sh),
-                        int(w * sw),
-                        int(h * sh)
-                    ])
-                    confs.append(float(final_conf))
-                    class_ids.append(int(class_id))
+            if max_score > CONF_THRESH:
+                cx, cy, w, h = det[:4]
+                boxes.append([
+                    int((cx - w / 2) * sw),
+                    int((cy - h / 2) * sh),
+                    int(w * sw),
+                    int(h * sh)
+                ])
+                confs.append(float(max_score))
+                class_ids.append(int(class_id))
 
-        indices = cv2.dnn.NMSBoxes(boxes, confs, 0.15, 0.45)
+        # Niepowtarzanie ramek (Non-Maximum Suppression)
+        indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRESH, NMS_THRESH)
         final = []
         if len(indices) > 0:
             for i in indices.flatten():
@@ -205,20 +208,24 @@ class UnifiedBackend:
             if local_frame is not None:
                 start = time.perf_counter()
                 try:
-                    # 1. Zmiana rozmiaru do 640x640 (tak jak w działającym teście)
+                    # Zapamiętujemy oryginalny wymiar pobrany z kamery (np. z Malinki lub lokalnej)
+                    orig_shape = local_frame.shape[:2]
+
+                    # 1. Zmiana rozmiaru do 640x640 (zgodnie z wymaganiami modelu)
                     if local_frame.shape[:2] != (640, 640):
                         local_frame = cv2.resize(local_frame, (640, 640))
 
-                    # 2. Kompresja do JPEG (Triton Ensemble oczekuje surowych bajtów pliku)
+                    # 2. Kompresja do JPEG
                     ret, buffer = cv2.imencode('.jpg', local_frame, encode_param)
                     if not ret:
                         continue
 
-                    jpeg_bytes = buffer.tobytes()
+                    # Spłaszczamy bufor bajtów do tablicy np.uint8 (tak jak w działającym teście)
+                    img_encoded = np.array(buffer, dtype=np.uint8).flatten()
 
-                    # 3. Przygotowanie wejścia gRPC zgodnie z konfiguracją modelu ensemble
-                    infer_input = grpcclient.InferInput("input_image", [1], "BYTES")
-                    infer_input.set_data_from_numpy(np.array([jpeg_bytes], dtype=object))
+                    # 3. Przygotowanie wejścia gRPC jako UINT8 ("input_image")
+                    infer_input = grpcclient.InferInput("input_image", img_encoded.shape, "UINT8")
+                    infer_input.set_data_from_numpy(img_encoded)
 
                     # 4. Wywołanie inferencji na serwerze Triton
                     res = self.triton_client.infer(
@@ -227,11 +234,11 @@ class UnifiedBackend:
                         outputs=[grpcclient.InferRequestedOutput("object_boundaries")]
                     )
 
-                    # 5. Odbiór i postprocessing danych wyjściowych
+                    # 5. Odbiór i postprocessing z uwzględnieniem oryginalnego rozmiaru klatki
                     raw_preds = res.as_numpy("object_boundaries")
-                    processed_results = self.post_process_triton(raw_preds, (640, 640))
+                    processed_results = self.post_process_triton(raw_preds, orig_shape)
 
-                    # 6. Aktualizacja struktur danych i statystyk
+                    # 6. Aktualizacja struktur danych i statystyk systemu
                     self.results_triton = processed_results
                     self.stats["triton"]["latency"] = (time.perf_counter() - start) * 1000
                     self.stats["triton"]["status"] = "Online"
@@ -239,8 +246,8 @@ class UnifiedBackend:
 
                 except Exception as e:
                     self.stats["triton"]["status"] = "Err"
-                    # Opcjonalnie: odkomentuj poniższe, jeśli chcesz debugować konkretny błąd w konsoli:
-                    # print(f"[Triton Worker Error]: {e}")
+                    # Jeśli chcesz debugować błędy w konsoli backendu, odkomentuj poniższą linię:
+                    # print(f"[Backend Triton Error]: {e}")
 
             time.sleep(0.01)
 
@@ -345,7 +352,7 @@ class UnifiedBackend:
 
     def run_local(self):
         """Tryb DEBUG: Uruchamia wątki i otwiera lokalne okno z podglądem wideo i metadanymi."""
-        Thread(target=self.camera_worker, daemon=True).start()
+        Thread(target=self.camera_worker_local, daemon=True).start()
         Thread(target=self.onnx_worker, daemon=True).start()
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
@@ -453,4 +460,4 @@ class UnifiedBackend:
 
 if __name__ == "__main__":
     hub = UnifiedBackend()
-    hub.run(False)
+    hub.run()
