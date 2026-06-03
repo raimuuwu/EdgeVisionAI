@@ -22,6 +22,13 @@ sub_sock.setsockopt(zmq.SUBSCRIBE, b"ai_stream")
 # 2. Konfiguracja gniazda testowego (REQ) do wysyłania pingów do backendu
 ping_sock = ctx.socket(zmq.REQ)
 ping_sock.setsockopt(zmq.RCVTIMEO, 2000)  # Timeout 2 sekundy na odpowiedź
+
+# ZABEZPIECZENIE: Luźna maszyna stanów REQ - pozwala na ponowne wysłanie PING po timeout
+if hasattr(zmq, 'REQ_RELAXED'):
+    ping_sock.setsockopt(zmq.REQ_RELAXED, 1)
+if hasattr(zmq, 'REQ_CORRELATE'):
+    ping_sock.setsockopt(zmq.REQ_CORRELATE, 1)
+
 ping_sock.connect(f"tcp://{BACKEND_IP}:5557")
 
 
