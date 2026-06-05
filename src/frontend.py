@@ -4,29 +4,26 @@ import numpy as np
 import json
 
 # --- KONFIGURACJA ---
-BACKEND_IP = "127.0.0.1" # <-- PAMIĘTAJ O ZMIANIE NA IP BACKENDU!
+BACKEND_IP = "127.0.0.1" 
 WINDOW_NAME = "AI Dashboard - CamOverIP"
 
 # Zmienne globalne do obsługi interfejsu (myszki i ekranu)
 ui_state = {
     "fullscreen": False,
     "hover_fs": False,
-    "width": 640 # Będzie aktualizowane dynamicznie
+    "width": 640 
 }
 
 def mouse_callback(event, x, y, flags, param):
     """Funkcja obsługująca zdarzenia myszki w oknie OpenCV"""
     w = param["width"]
     
-    # Współrzędne naszego przycisku Fullscreen (Prawy górny róg)
     in_button = (w - 160 <= x <= w - 15) and (15 <= y <= 45)
 
     if event == cv2.EVENT_MOUSEMOVE:
-        # Reakcja na najechanie myszką (Hover)
         param["hover_fs"] = in_button
         
     elif event == cv2.EVENT_LBUTTONDOWN:
-        # Reakcja na kliknięcie lewym przyciskiem myszy
         if in_button:
             param["fullscreen"] = not param["fullscreen"]
             if param["fullscreen"]:
@@ -53,7 +50,6 @@ def start_frontend():
     ping_sock.setsockopt(zmq.RCVTIMEO, 2000) 
     ping_sock.setsockopt(zmq.SNDTIMEO, 2000)
 
-    # Inicjalizacja okna i podpięcie "słuchacza" myszki
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback, ui_state)
 
@@ -61,14 +57,12 @@ def start_frontend():
 
     while True:
         try:
-            # --- ZAMYKANIE KRZYŻYKIEM ("X") W PASKU WINDOWS ---
-            # Sprawdzamy czy okno nadal istnieje
             try:
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     print("[*] Zamknięto okno. Wychodzenie z aplikacji...")
                     break
             except cv2.error:
-                break # Jeśli wyrzuci błąd, znaczy że okno już usunięto
+                break
 
             if video_sock.poll(10): 
                 topic, metadata_bytes, frame_bytes = video_sock.recv_multipart()
@@ -79,7 +73,7 @@ def start_frontend():
 
                 if frame is not None:
                     h, w = frame.shape[:2]
-                    ui_state["width"] = w # Aktualizacja szerokości dla kliknięć myszki
+                    ui_state["width"] = w 
                     
                     # 1. RYSOWANIE HUDU (Overlay)
                     overlay = frame.copy()
@@ -98,8 +92,6 @@ def start_frontend():
                     draw_shadow_text(frame, f"TRITON: {t['status']} ({t['latency']:.0f}ms)", (15, 50), (255, 150, 50), 0.65, 2)
                     draw_shadow_text(frame, f"Detekcje -> ONNX: {len(onnx_data)} | TRITON: {len(triton_data)}", (15, 75), (255, 255, 255), 0.6, 2)
 
-                    # --- RYSOWANIE INTERAKTYWNEGO GUZIKA FULLSCREEN ---
-                    # Zmienia kolor w zależności od tego, czy najechałeś myszką (hover)
                     btn_bg_color = (100, 100, 100) if ui_state["hover_fs"] else (40, 40, 40)
                     cv2.rectangle(frame, (w - 160, 15), (w - 15, 45), btn_bg_color, -1)
                     cv2.rectangle(frame, (w - 160, 15), (w - 15, 45), (255, 255, 255), 1) # Biała ramka
@@ -137,10 +129,9 @@ def start_frontend():
 
                     cv2.imshow(WINDOW_NAME, frame)
 
-            # Zawsze przechwytujemy zdarzenia klawiatury
             key = cv2.waitKey(10) & 0xFF
             
-            if key == ord('q') or key == 27: # 27 to klawisz ESC
+            if key == ord('q') or key == 27: 
                 break
             elif key == ord('t'):
                 print("\n[*] Wysyłam testowy PING do backendu...")
