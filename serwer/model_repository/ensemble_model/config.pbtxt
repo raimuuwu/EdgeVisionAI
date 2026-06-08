@@ -1,0 +1,49 @@
+name: "ensemble_model"
+platform: "ensemble"
+max_batch_size: 0
+
+input [
+  {
+    name: "input_image"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+output [
+  {
+    name: "object_boundaries"
+    data_type: TYPE_FP32
+    dims: [ 1, -1, 85 ]
+  }
+]
+
+ensemble_scheduling {
+  step [
+    # STEP 1: PREPROCESSING
+    {
+      model_name: "detection_preprocessing"
+      model_version: -1
+      input_map {
+        key: "raw_bytes"
+        value: "input_image"
+      }
+      output_map {
+        key: "tensors"
+        value: "preprocessed_image"
+      }
+    },
+    # STEP 2: INFERENCE
+    {
+      model_name: "boundary_detection"
+      model_version: -1
+      input_map {
+        key: "images"
+        value: "preprocessed_image"
+      }
+      output_map {
+        key: "output0"
+        value: "object_boundaries"
+      }
+    }
+  ]
+}
