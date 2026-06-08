@@ -11,32 +11,23 @@ class TritonPythonModel:
         responses = []
         for request in requests:
             try:
-                # 1. Pobranie z Tritona
+                # odczyt wychwytywanych bajtow
                 in_tensor = pb_utils.get_input_tensor_by_name(request, "raw_bytes")
                 if in_tensor is None:
                     raise ValueError("Triton przekazal puste wejscie")
 
-                raw = in_tensor.as_numpy()
-                jpeg_bytes = raw.flatten()[0]
+                img_array = in_tensor.as_numpy()
+                
+                if img_array.size < 100:
+                    raise ValueError(f"Otrzymano {img_array.size} bajtow, to za malo.")
 
-                img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-
-                if img_array.size == 0:
-                    raise ValueError(f"Otrzymano pusty bufor bajtow")
-
-
-                # 2. Dekodowanie
+                # Dekodowanie
                 img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
                 if img is None:
-                    # Zaloguj rozmiar bufora zeby pomoc w diagnostyce
-                    raise ValueError(
-                        f"cv2.imdecode zwrocilo None. "
-                        f"Rozmiar bufora: {img_array.size} bajtow, "
-                        f"pierwsze bajty: {img_array[:16].tolist()}"
-                    )                
+                    raise ValueError(f"cv2.imdecode zwrocilo None.")
 
-                # 3. Preprocessing do YOLO
+                # Preprocessing pod YOLOv8
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(img, (640, 640))
                 img = img.astype(np.float32) / 255.0
@@ -45,19 +36,17 @@ class TritonPythonModel:
 
                 img = np.ascontiguousarray(img, dtype=np.float32)
 
-                # 4. Output
                 out_tensor = pb_utils.Tensor("tensors", img)
                 responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
 
             except Exception as e:
                 error_msg = f"Triton Python Error: {traceback.format_exc()}"
                 print(error_msg)
-                # Zwracamy fallback zamiast TritonError zeby ensemble nie dostawal pustego outputu.
-                # Czarna klatka pozwoli modelowi ONNX wykonac sie i zwrocic wynik (bez wykryc).
+                
+                # Zwracamy czarną klatkę jako Fallback
                 fallback = np.zeros((1, 3, 640, 640), dtype=np.float32)
                 out_tensor = pb_utils.Tensor("tensors", fallback)
                 responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
-
 
         return responses
 
