@@ -8,12 +8,12 @@ import json
 import imagezmq
 
 # --- KONFIGURACJA ADRESÓW ---
-ONNX_IP = "127.0.0.1"
-TRITON_URL = "10.140.123.226:8001"
-TRITON_MODEL = "ensemble_model"  # Zmieniono z 'boundary_detection' na działający 'ensemble_model'
-RPI_VPN_IP = "malinkaedgevision"
+ONNX_IP = "" # adres ip serwera z onnx (serwer_onnx.py)
+TRITON_URL = ":8001" # adres ip serwera triton
+TRITON_MODEL = "ensemble_model"
+RPI_VPN_IP = "" # adres ip kamerki
 
-# --- PROGI DETEKCJI ZGODNE Z DZIAŁAJĄCYM SKRYPTEM ---
+# --- PROGI DETEKCJI  ---
 CONF_THRESH = 0.25
 NMS_THRESH = 0.45
 
@@ -61,7 +61,7 @@ class UnifiedBackend:
     def camera_worker_local(self):
         #--- WERSJA Z LOKALNĄ KAMERKĄ LAPTOPA (DO TESTÓW) ---
         print("[*] Inicjalizacja lokalnej kamerki laptopa...")
-        cap = cv2.VideoCapture(0)  # 0 to domyślna wbudowana kamera
+        cap = cv2.VideoCapture(0)
 
         if not cap.isOpened():
             print("[-] BŁĄD: Nie można otworzyć lokalnej kamerki.")
@@ -92,9 +92,6 @@ class UnifiedBackend:
         print("[*] Zatrzymano camera_worker (Lokalna kamerka).")
 
     def camera_worker(self):
-        # !!! WPISZ TUTAJ ADRES IP MALINKI Z OPENVPN (z interfejsu tun0 Malinki) !!!
-        # Na podstawie Twojego zrzutu, jeśli laptop to .45, Malinka pewnie ma coś blisko w klasie 10.141.6.x
-
         port = 5555
 
         print(f"[*] [OpenVPN Mode] Łączę się ze strumieniem RPi pod adresem: tcp://{RPI_VPN_IP}:{port}")
@@ -208,10 +205,10 @@ class UnifiedBackend:
             if local_frame is not None:
                 start = time.perf_counter()
                 try:
-                    # Zapamiętujemy oryginalny wymiar pobrany z kamery (np. z Malinki lub lokalnej)
+                    # Zapamiętujemy oryginalny wymiar pobrany z kamery
                     orig_shape = local_frame.shape[:2]
 
-                    # 1. Zmiana rozmiaru do 640x640 (zgodnie z wymaganiami modelu)
+                    # 1. Zmiana rozmiaru do 640x640
                     if local_frame.shape[:2] != (640, 640):
                         local_frame = cv2.resize(local_frame, (640, 640))
 
@@ -220,7 +217,7 @@ class UnifiedBackend:
                     if not ret:
                         continue
 
-                    # Spłaszczamy bufor bajtów do tablicy np.uint8 (tak jak w działającym teście)
+                    # Spłaszczamy bufor bajtów do tablicy
                     img_encoded = np.array(buffer, dtype=np.uint8).flatten()
 
                     # 3. Przygotowanie wejścia gRPC jako UINT8 ("input_image")
@@ -246,8 +243,6 @@ class UnifiedBackend:
 
                 except Exception as e:
                     self.stats["triton"]["status"] = "Err"
-                    # Jeśli chcesz debugować błędy w konsoli backendu, odkomentuj poniższą linię:
-                    # print(f"[Backend Triton Error]: {e}")
 
             time.sleep(0.01)
 
@@ -300,7 +295,6 @@ class UnifiedBackend:
         Thread(target=self.triton_worker, daemon=True).start()
         Thread(target=self.stats_printer, daemon=True).start()
 
-        # Inteligentne wsparcie dla wątku testowego (ping_worker), jeśli istnieje w tej wersji klasy
         if hasattr(self, 'ping_worker'):
             Thread(target=self.ping_worker, daemon=True).start()
 
@@ -373,7 +367,7 @@ class UnifiedBackend:
             current_onnx = list(self.results_onnx)
             for p in current_onnx:
                 try:
-                    # OBSŁUGA FORMATU: Słownik {'box': [x1,y1,x2,y2], 'conf':..., 'class':...}
+                    # OBSŁUGA FORMATU
                     if isinstance(p, dict) and 'box' in p:
                         box = p['box']
                         class_id = p.get('class', 0)

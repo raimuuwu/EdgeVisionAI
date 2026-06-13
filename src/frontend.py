@@ -4,7 +4,7 @@ import numpy as np
 import json
 
 # --- KONFIGURACJA ---
-BACKEND_IP = "127.0.0.1" 
+BACKEND_IP = " " # adres ip backendu (backend.py)
 WINDOW_NAME = "AI Dashboard - CamOverIP"
 
 # Zmienne globalne do obsługi interfejsu (myszki i ekranu)
